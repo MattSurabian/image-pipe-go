@@ -9,6 +9,10 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"sync"
+	"io"
+	"github.com/minio/minio-go"
+	"github.com/spf13/cobra/cobra/cmd"
 )
 
 const version = "dev"
@@ -76,12 +80,48 @@ type resizeRequest struct {
 func mainEndpoint(c *gin.Context) {
 	var image resizeRequest
 	c.BindJSON(&image)
-	src := SourceURI(image.URI)
-	key := os.Getenv("AWS_ACCESS_KEY_ID")
-	secret := os.Getenv("AWS_SECRET_ACCESS_KEY")
-	dest := DestObjectStorage(key, secret, image.Bucket, image.Key)
+
+	// Fetch remote image via http
+	response, err := http.Get(image.URI)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer response.Body.Close()
+
+	// Setup imagemagick convert call and get in/out pipe references
 	resizer := Resizer(image.Width)
-	Pipe(resizer, src, dest)
+	resizerOut, _ := resizer.StdoutPipe()
+	resizerIn, _ := resizer.StdinPipe()
+
+	// Get an S3 client to use for uploading
+	client, err := GetS3Client(os.Getenv("AWS_ACCESS_KEY_ID"), os.Getenv("AWS_SECRET_ACCESS_KEY"))
+	if err != nil {
+		log.Fatal("Problem accessing AWS S3: ", err)
+	}
+
+	// Our resizer command provides a wait, but uploading to S3 does not. Wait group to the rescue.
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+
+	// Routine to take from the http request and stream into the resizer
+	go func() {
+		defer resizerIn.Close()
+		io.Copy(resizerIn, response.Body)
+		resizer.Start()
+	}()
+
+	// Routine to take from the resizer and send to S3
+	go func() {
+		defer resizerOut.Close()
+		client.PutObject(image.Bucket, image.Key, resizerOut, -1, minio.PutObjectOptions{})
+		wg.Done()
+	}()
+
+	// error catching on the wait would be problematic because of our go routines, if err info is needed
+	// better to report resizer.StderrPipe
+	resizer.Wait()
+	wg.Wait()
+
 	c.JSON(http.StatusOK, image)
 }
 
